@@ -119,6 +119,15 @@ Tested with snowflake-arctic-embed-m-v2.0 (768-dim embedding model):
 
 The CUDA vs CPU-disabled test confirms GPU acceleration is active. The similar cold-start times (135ms ORT CPU vs 149ms CUDA) reflect that cold start is dominated by model loading; the CUDA advantage becomes clear in sustained/warm inference (e.g., MCP server with persistent session).
 
+### Verification
+
+With `RUST_LOG=ort=debug`, ORT confirms CUDA activation:
+
+    INFO ort::logging: Creating BFCArena for Cuda ...
+    INFO ort::logging: Extending BFCArena for Cuda. bin_num:20 num_bytes: 768147456
+
+768MB allocated on GPU for model weights. Only lightweight shape ops fall back to CPU — standard ORT optimisation behaviour.
+
 ## Build Instructions
 
 If you want to build from source rather than using the prebuilt binaries:
