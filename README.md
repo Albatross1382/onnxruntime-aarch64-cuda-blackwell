@@ -64,8 +64,6 @@ ort = { version = "=2.0.0-rc.12", features = ["cuda", "load-dynamic"] }
 ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so cargo run --release
 ```
 
-> **Important:** The `ort` crate's built-in CUDA EP registration (V2 API) silently fails with `load-dynamic` on ORT 1.24.4. The CUDA EP appears to register but inference falls back to CPU. You must use the legacy C API (`OrtSessionOptionsAppendExecutionProvider_CUDA`) via FFI. See the [Rust CUDA EP Workaround](#rust-ort-crate-cuda-ep-workaround) section below.
-
 ### C/C++
 ```c
 #include <dlfcn.h>
@@ -73,38 +71,39 @@ void* lib = dlopen("/usr/local/lib/libonnxruntime.so", RTLD_LAZY);
 // Use ORT C API as normal
 ```
 
-## Rust `ort` Crate CUDA EP Workaround
+## Rust `ort` Crate Usage Notes
 
-The `ort` crate (v2.0.0-rc.12) registers CUDA via `SessionOptionsAppendExecutionProvider_CUDA_V2`, which is part of the ORT API struct. With `load-dynamic`, this registration silently succeeds but ORT doesn't route ops to CUDA. The legacy standalone function `OrtSessionOptionsAppendExecutionProvider_CUDA` works correctly.
+The `ort` crate's native CUDA EP registration works correctly with `load-dynamic`:
 
 ```rust
-use ort::AsPointer;
-
-let mut builder = ort::session::Session::builder()?;
-
-// Register CUDA EP via legacy C API
-unsafe {
-    let opts_ptr = builder.ptr() as *mut core::ffi::c_void;
-
-    type CudaEpFn = unsafe extern "C" fn(
-        *mut core::ffi::c_void, i32
-    ) -> *mut core::ffi::c_void;
-
-    let dylib_path = std::env::var("ORT_DYLIB_PATH")
-        .unwrap_or_else(|_| "/usr/local/lib/libonnxruntime.so".to_string());
-    let lib = libloading::Library::new(&dylib_path)?;
-    let func: libloading::Symbol<CudaEpFn> = lib
-        .get(b"OrtSessionOptionsAppendExecutionProvider_CUDA")?;
-
-    let status = func(opts_ptr, 0); // device_id = 0
-    if !status.is_null() {
-        eprintln!("CUDA EP registration failed, falling back to CPU");
-    }
-    std::mem::forget(lib); // Keep library loaded
-}
-
-let session = builder.commit_from_file("model.onnx")?;
+let session = ort::session::Session::builder()?
+    .with_execution_providers([
+        ort::ep::CUDA::default().build(),
+        ort::ep::CPU::default().build(),
+    ])?
+    .commit_from_file("model.onnx")?;
 ```
+
+**Critical:** Add `tracing-subscriber` to your application and initialise it before creating sessions. Without it, `RUST_LOG` produces no output and you have zero visibility into whether CUDA EP is active. This is the #1 debugging trap.
+
+```toml
+[dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+```
+
+```rust
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    // ... your code
+}
+```
+
+Run with `RUST_LOG=ort=debug` to confirm CUDA activation:
+
+    INFO ort::ep: Successfully registered `CUDAExecutionProvider`
+    INFO ort::logging: Creating BFCArena for Cuda ...
 
 ## Performance
 
@@ -163,12 +162,12 @@ cd onnxruntime
 | `nvcc fatal: Unsupported gpu architecture 'compute_53'` | Add `--cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=121` |
 | sm_120 vs sm_121 | GB10 is compute capability 12.1, NOT 12.0. Use `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` to check |
 | `ort-sys` downloads CPU-only binary | No aarch64+CUDA prebuilts on pyke.io. Use `load-dynamic` + `ORT_DYLIB_PATH` |
-| CUDA EP silently falls back to CPU | `ort` crate V2 API issue with `load-dynamic`. Use legacy FFI (see above) |
+| No CUDA feedback from ort crate | Add `tracing-subscriber` and run with `RUST_LOG=ort=debug`. Without it, EP registration is invisible. |
 
 ## Known Limitations
 
 - INT8 quantized models may not have CUDA kernels for sm_121. Use FP32 models for CUDA inference.
-- The `ort` Rust crate's `fail_silently()` default on EP registration masks CUDA failures. Use `.error_on_failure()` during debugging.
+- Without `tracing-subscriber` initialised, the `ort` crate provides zero feedback on EP registration. Add it before debugging.
 - GB10 uses unified memory — `nvidia-smi` won't show separate GPU memory usage for CUDA compute processes.
 
 ## License
